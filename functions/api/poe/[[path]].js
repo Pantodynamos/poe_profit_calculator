@@ -3,14 +3,16 @@ const POE_API_BASE = 'https://poe.ninja/poe1/api/economy/';
 
 export async function onRequestGet(context) {
   const { request, params } = context;
+
   const path = Array.isArray(params.path)
     ? params.path.join('/')
     : params.path || '';
 
-  // Only expose the economy endpoints this application needs.
   const allowedPath =
     path === 'leagues' ||
-    /^stash\/current\/(item|currency)\/overview$/.test(path);
+    /^exchange\/current\/overview$/.test(path) ||
+    /^stash\/current\/item\/overview$/.test(path) ||
+    /^stash\/current\/currency\/overview$/.test(path);
 
   if (!allowedPath) {
     return Response.json(
@@ -21,6 +23,8 @@ export async function onRequestGet(context) {
 
   const incomingUrl = new URL(request.url);
   const upstreamUrl = new URL(path, POE_API_BASE);
+
+  // Preserve query parameters such as league=Standard&type=Fossil.
   upstreamUrl.search = incomingUrl.search;
 
   try {
@@ -48,7 +52,7 @@ export async function onRequestGet(context) {
       status: upstream.status,
       headers,
     });
-  } catch (error) {
+  } catch {
     return Response.json(
       { error: 'Unable to reach poe.ninja' },
       {
