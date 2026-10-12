@@ -38,6 +38,7 @@ class MarketItem {
   });
 }
 
+
 class PoePriceService {
   PoePriceService._();
 
@@ -52,10 +53,7 @@ class PoePriceService {
 
   static const Duration cacheDuration = Duration(minutes: 10);
 
-  // Categories supported by poe.ninja's exchange overview endpoint.
   static const Map<String, String> exchangeTypes = {
-    'Currency': 'Currency',
-    'Fragments': 'Fragment',
     'Scarabs': 'Scarab',
     'Divination Cards': 'DivinationCard',
     'Essences': 'Essence',
@@ -64,7 +62,6 @@ class PoePriceService {
     'Delirium Orbs': 'DeliriumOrb',
   };
 
-  // Categories supported by poe.ninja's stash item overview endpoint.
   static const Map<String, String> categories = {
     'Currency': 'Currency',
     'Fragments': 'Fragment',
@@ -175,9 +172,17 @@ class PoePriceService {
       return cached;
     }
 
-    final List<MarketItem> items;
+    late final List<MarketItem> items;
 
-    if (exchangeTypes.containsKey(category)) {
+    // Currency and Fragments have their own stash currency endpoint.
+    // This response provides currencyTypeName and chaosEquivalent.
+    if (category == 'Currency' || category == 'Fragments') {
+      items = await _fetchStashCurrencyCategory(
+        league,
+        category,
+        type,
+      );
+    } else if (exchangeTypes.containsKey(category)) {
       items = await _fetchExchangeCategory(
         league,
         category,
@@ -191,10 +196,109 @@ class PoePriceService {
       );
     }
 
-    _cache[key] = items;
-    _cacheTime[key] = DateTime.now();
+    // Do not cache empty results. A transient API or proxy failure
+    // should not hide a category for the next ten minutes.
+    if (items.isNotEmpty) {
+      _cache[key] = items;
+      _cacheTime[key] = DateTime.now();
+    }
 
     return items;
+  }
+
+  double _readNumber(dynamic value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  Map<String, dynamic> _asStringMap(dynamic value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) return Map<String, dynamic>.from(value);
+    return <String, dynamic>{};
+  }
+
+  void _addMetadata(
+    Map<String, Map<String, dynamic>> itemsById,
+    dynamic rawItem, {
+    String? fallbackId,
+  }) {
+    if (rawItem is! Map) return;
+
+    final item = Map<String, dynamic>.from(rawItem);
+    final id = item['id']?.toString() ??
+        item['detailsId']?.toString() ??
+        fallbackId;
+
+    if (id != null && id.isNotEmpty) {
+      itemsById[id] = item;
+    }
+  }
+
+  String _findExchangeItemName(
+    Map<String, dynamic> line,
+    Map<String, Map<String, dynamic>> itemsById,
+  ) {
+    final id = line['id']?.toString() ?? '';
+    final metadata = itemsById[id];
+
+    final metadataName = metadata?['name']?.toString() ?? '';
+    if (metadataName.isNotEmpty) return metadataName;
+
+    final lineName = line['name']?.toString() ?? '';
+    if (lineName.isNotEmpty) return lineName;
+
+    // Some response variants expose item details through an
+    // alternate metadata field rather than core.items.
+    final item = _asStringMap(line['item']);
+    final itemName = item['name']?.toString() ?? '';
+    if (itemName.isNotEmpty) return itemName;
+
+    return '';
+  }
+
+  Future<List<MarketItem>> _fetchStashCurrencyCategory(
+    String league,
+    String category,
+    String type,
+  ) async {
+    final data = await _getJson(
+      'stash/current/currency/overview',
+      queryParameters: {
+        'league': league,
+        'type': type,
+      },
+    );
+
+    final rawLines = data['lines'];
+
+    if (rawLines is! List) {
+      throw Exception(
+        'Unexpected stash currency response for $category: '
+        'missing lines.',
+      );
+    }
+
+    final results = <MarketItem>[];
+
+    for (final rawLine in rawLines) {
+      if (rawLine is! Map) continue;
+
+      final line = Map<String, dynamic>.from(rawLine);
+      final name = line['currencyTypeName']?.toString() ?? '';
+      final price = _readNumber(line['chaosEquivalent']);
+
+      if (name.isEmpty || price <= 0) continue;
+
+      results.add(
+        MarketItem(
+          name: name,
+          chaosValue: price,
+          category: category,
+        ),
+      );
+    }
+
+    return results;
   }
 
   Future<List<MarketItem>> _fetchExchangeCategory(
@@ -218,33 +322,42 @@ class PoePriceService {
       );
     }
 
-    final core = data['core'] is Map
-        ? Map<String, dynamic>.from(data['core'] as Map)
-        : <String, dynamic>{};
-
-    // The exchange response contains item metadata separately from
-    // its price lines. Match the line ID with the metadata ID.
-    final Map<String, Map<String, dynamic>> itemsById = {};
+    final core = _asStringMap(data['core']);
+    final itemsById = <String, Map<String, dynamic>>{};
     final rawItems = core['items'];
 
     if (rawItems is List) {
       for (final rawItem in rawItems) {
-        if (rawItem is! Map) continue;
-
-        final item = Map<String, dynamic>.from(rawItem);
-        final id = item['id']?.toString();
-
-        if (id != null && id.isNotEmpty) {
-          itemsById[id] = item;
-        }
+        _addMetadata(itemsById, rawItem);
       }
     } else if (rawItems is Map) {
       rawItems.forEach((key, value) {
-        if (value is Map) {
-          itemsById[key.toString()] =
-              Map<String, dynamic>.from(value);
-        }
+        _addMetadata(
+          itemsById,
+          value,
+          fallbackId: key.toString(),
+        );
       });
+    }
+
+    // Support metadata exposed through primary/secondary collections
+    // as well as core.items.
+    for (final collectionName in ['primary', 'secondary']) {
+      final collection = core[collectionName];
+
+      if (collection is List) {
+        for (final rawItem in collection) {
+          _addMetadata(itemsById, rawItem);
+        }
+      } else if (collection is Map) {
+        collection.forEach((key, value) {
+          _addMetadata(
+            itemsById,
+            value,
+            fallbackId: key.toString(),
+          );
+        });
+      }
     }
 
     final results = <MarketItem>[];
@@ -253,19 +366,8 @@ class PoePriceService {
       if (rawLine is! Map) continue;
 
       final line = Map<String, dynamic>.from(rawLine);
-      final id = line['id']?.toString() ?? '';
-      final metadata = itemsById[id];
-
-      final name = metadata?['name']?.toString() ??
-          line['name']?.toString() ??
-          '';
-
-      // poe.ninja exchange overview prices are expressed in the
-      // primary reference currency reported by the API.
-      final rawPrice = line['primaryValue'];
-      final price = rawPrice is num
-          ? rawPrice.toDouble()
-          : double.tryParse(rawPrice?.toString() ?? '') ?? 0;
+      final name = _findExchangeItemName(line, itemsById);
+      final price = _readNumber(line['primaryValue']);
 
       if (name.isEmpty || price <= 0) continue;
 
@@ -309,11 +411,7 @@ class PoePriceService {
 
       final line = Map<String, dynamic>.from(rawLine);
       final name = line['name']?.toString() ?? '';
-
-      final rawPrice = line['chaosValue'];
-      final price = rawPrice is num
-          ? rawPrice.toDouble()
-          : double.tryParse(rawPrice?.toString() ?? '') ?? 0;
+      final price = _readNumber(line['chaosValue']);
 
       if (name.isEmpty || price <= 0) continue;
 
@@ -345,14 +443,20 @@ class PoePriceService {
             .where((entry) => entry.key == category)
             .toList();
 
+    // Fetch categories independently. If one endpoint fails, preserve
+    // results from the other categories instead of failing the search.
     final results = await Future.wait(
-      selectedCategories.map(
-        (entry) => _fetchCategory(
-          league,
-          entry.key,
-          entry.value,
-        ),
-      ),
+      selectedCategories.map((entry) async {
+        try {
+          return await _fetchCategory(
+            league,
+            entry.key,
+            entry.value,
+          );
+        } catch (_) {
+          return <MarketItem>[];
+        }
+      }),
     );
 
     final allItems = results.expand((items) => items).toList();
@@ -398,6 +502,7 @@ class PoePriceService {
     _client.close();
   }
 }
+
 
 class InvestmentItem {
   InvestmentItem({

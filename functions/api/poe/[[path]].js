@@ -1,12 +1,9 @@
 
 const POE_API_BASE = 'https://poe.ninja/poe1/api/economy/';
 
-export async function onRequestGet(context) {
-  const { request, params } = context;
-
-  const path = Array.isArray(params.path)
-    ? params.path.join('/')
-    : params.path || '';
+export async function onRequestGet({ request }) {
+  const incomingUrl = new URL(request.url);
+  const path = incomingUrl.pathname.replace(/^\/api\/poe\/?/, '');
 
   const allowedPath =
     path === 'leagues' ||
@@ -16,15 +13,12 @@ export async function onRequestGet(context) {
 
   if (!allowedPath) {
     return Response.json(
-      { error: 'Endpoint not allowed' },
+      { error: 'Endpoint not allowed', path },
       { status: 404 }
     );
   }
 
-  const incomingUrl = new URL(request.url);
   const upstreamUrl = new URL(path, POE_API_BASE);
-
-  // Preserve query parameters such as league=Standard&type=Fossil.
   upstreamUrl.search = incomingUrl.search;
 
   try {
@@ -39,18 +33,16 @@ export async function onRequestGet(context) {
       },
     });
 
-    const headers = new Headers({
-      'Content-Type':
-        upstream.headers.get('Content-Type') || 'application/json',
-      'Cache-Control': upstream.ok
-        ? 'public, max-age=300'
-        : 'no-store',
-      'X-Content-Type-Options': 'nosniff',
-    });
-
     return new Response(upstream.body, {
       status: upstream.status,
-      headers,
+      headers: {
+        'Content-Type':
+          upstream.headers.get('Content-Type') || 'application/json',
+        'Cache-Control': upstream.ok
+          ? 'public, max-age=300'
+          : 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
     });
   } catch {
     return Response.json(
