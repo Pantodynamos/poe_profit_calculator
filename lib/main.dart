@@ -1,3 +1,4 @@
+
 import 'dart:async';
 import 'dart:convert';
 
@@ -52,6 +53,8 @@ class PoePriceService {
   static const Duration cacheDuration = Duration(minutes: 10);
 
   static const Map<String, String> exchangeTypes = {
+    'Currency': 'Currency',
+    'Fragments': 'Fragment',
     'Scarabs': 'Scarab',
     'Divination Cards': 'DivinationCard',
     'Essences': 'Essence',
@@ -174,7 +177,9 @@ class PoePriceService {
     late final List<MarketItem> items;
 
     if (category == 'Currency' || category == 'Fragments') {
-      items = await _fetchStashCurrencyCategory(
+      // Combine stash and exchange data. Some leagues have exchange
+      // prices for items that do not appear in their stash data.
+      items = await _fetchCombinedCurrencyCategory(
         league,
         category,
         type,
@@ -211,6 +216,82 @@ class PoePriceService {
     if (value is Map<String, dynamic>) return value;
     if (value is Map) return Map<String, dynamic>.from(value);
     return <String, dynamic>{};
+  }
+
+  // Normalizes names for matching and deduplication.
+  // For example, "Hinekora's Lock" and "Hinekoras Lock"
+  // produce the same key.
+  String _normalizeItemName(String value) {
+    return value.toLowerCase().replaceAll(
+          RegExp(r'[^a-z0-9]'),
+          '',
+        );
+  }
+
+  Future<List<MarketItem>> _fetchCombinedCurrencyCategory(
+    String league,
+    String category,
+    String type,
+  ) async {
+    List<MarketItem> stashItems = [];
+    List<MarketItem> exchangeItems = [];
+
+    Object? stashError;
+    Object? exchangeError;
+
+    // Attempt stash data independently so an unavailable stash
+    // endpoint does not prevent the exchange request from succeeding.
+    try {
+      stashItems = await _fetchStashCurrencyCategory(
+        league,
+        category,
+        type,
+      );
+    } catch (e) {
+      stashError = e;
+      lastCategoryErrors.add('$category stash: $e');
+    }
+
+    // Exchange supports Currency and Fragment. Fetch it even when
+    // stash data is available because some items exist only in exchange.
+    try {
+      exchangeItems = await _fetchExchangeCategory(
+        league,
+        category,
+        type,
+      );
+    } catch (e) {
+      exchangeError = e;
+      lastCategoryErrors.add('$category exchange: $e');
+    }
+
+    // If both sources fail, report the failure instead of silently
+    // treating the category as an ordinary empty result.
+    if (stashError != null && exchangeError != null) {
+      throw Exception(
+        'Both stash and exchange requests failed for $category. '
+        'Stash: $stashError. Exchange: $exchangeError',
+      );
+    }
+
+    // Insert stash prices first. Exchange items are added only when
+    // the normalized name does not already exist, preserving the
+    // stash price for items found in both sources.
+    final merged = <String, MarketItem>{};
+
+    for (final item in stashItems) {
+      final key = _normalizeItemName(item.name);
+      if (key.isEmpty) continue;
+      merged.putIfAbsent(key, () => item);
+    }
+
+    for (final item in exchangeItems) {
+      final key = _normalizeItemName(item.name);
+      if (key.isEmpty) continue;
+      merged.putIfAbsent(key, () => item);
+    }
+
+    return merged.values.toList();
   }
 
   Future<List<MarketItem>> _fetchStashCurrencyCategory(
@@ -276,14 +357,6 @@ class PoePriceService {
   }
 
   String _humanizeExchangeId(String id) {
-    // Exchange line IDs commonly look like:
-    // abyss-scarab-of-descending
-    // eldritch-chaos-orb
-    // apothecary
-    //
-    // These IDs are useful as a fallback when poe.ninja's core.items
-    // metadata does not contain the corresponding item.
-
     final cleaned = id
         .trim()
         .replaceAll(RegExp(r'[_]+'), '-')
@@ -292,24 +365,11 @@ class PoePriceService {
 
     if (cleaned.isEmpty) return '';
 
-    const preserveUppercase = {
-      'abyss',
-      'vaal',
-      'ultimatum',
-      'eldritch',
-      'maven',
-    };
-
     return cleaned
         .split('-')
         .where((part) => part.isNotEmpty)
         .map((part) {
           final lower = part.toLowerCase();
-
-          if (preserveUppercase.contains(lower)) {
-            return lower[0].toUpperCase() + lower.substring(1);
-          }
-
           return lower[0].toUpperCase() + lower.substring(1);
         })
         .join(' ');
@@ -321,7 +381,7 @@ class PoePriceService {
   ) {
     final id = line['id']?.toString() ?? '';
 
-    // First, use metadata if poe.ninja provides it.
+    // Prefer poe.ninja metadata when available.
     final metadata = itemsById[id];
     final metadataName = metadata?['name']?.toString().trim() ?? '';
 
@@ -338,7 +398,7 @@ class PoePriceService {
 
     if (itemName.isNotEmpty) return itemName;
 
-    // Some exchange responses use detailsId rather than id.
+    // Some exchange responses use detailsId instead of id.
     final detailsId = line['detailsId']?.toString() ?? '';
     final detailsMetadata = itemsById[detailsId];
     final detailsName =
@@ -346,8 +406,7 @@ class PoePriceService {
 
     if (detailsName.isNotEmpty) return detailsName;
 
-    // Critical fallback: exchange line IDs still identify the item
-    // even when core.items contains only currency metadata.
+    // Exchange line IDs are still useful when metadata is missing.
     if (id.isNotEmpty) {
       return _humanizeExchangeId(id);
     }
@@ -493,7 +552,7 @@ class PoePriceService {
     }
 
     final league = currentLeague!;
-    final normalizedQuery = query.trim().toLowerCase();
+    final normalizedQuery = _normalizeItemName(query.trim());
 
     if (normalizedQuery.length < 2) {
       return const <MarketItem>[];
@@ -507,8 +566,8 @@ class PoePriceService {
             .where((entry) => entry.key == category)
             .toList();
 
-    // Load the selected categories independently. One failing API
-    // endpoint must not discard results from the other categories.
+    // Load selected categories independently. A failing endpoint
+    // must not discard results returned by other categories.
     final categoryResults = await Future.wait(
       selectedCategories.map((entry) async {
         try {
@@ -526,21 +585,24 @@ class PoePriceService {
 
     final allItems = categoryResults.expand((items) => items).toList();
 
-    // Deduplicate by category and item name.
+    // Deduplicate by category and normalized item name.
     final uniqueItems = <String, MarketItem>{};
 
     for (final item in allItems) {
-      final key = '${item.category}:${item.name.toLowerCase()}';
+      final key =
+          '${item.category}:${_normalizeItemName(item.name)}';
       uniqueItems.putIfAbsent(key, () => item);
     }
 
+    // Match without punctuation so searches like "Hinekora's Lock"
+    // also match exchange IDs whose generated names omit apostrophes.
     final matches = uniqueItems.values.where((item) {
-      return item.name.toLowerCase().contains(normalizedQuery);
+      return _normalizeItemName(item.name).contains(normalizedQuery);
     }).toList();
 
     matches.sort((a, b) {
-      final aName = a.name.toLowerCase();
-      final bName = b.name.toLowerCase();
+      final aName = _normalizeItemName(a.name);
+      final bName = _normalizeItemName(b.name);
 
       final aExact = aName == normalizedQuery;
       final bExact = bName == normalizedQuery;
@@ -552,8 +614,6 @@ class PoePriceService {
 
       if (aStarts != bStarts) return aStarts ? -1 : 1;
 
-      // When names match, prefer the item with the higher price only
-      // as a stable tie-breaker. This does not change the item price.
       return a.name.compareTo(b.name);
     });
 
