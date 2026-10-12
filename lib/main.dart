@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -73,30 +72,45 @@ class PoePriceService {
     'Invitations': 'Invitation',
   };
 
-  Future<Map<String, dynamic>> _getJson(String path) async {
-    final uri = Uri.parse('$poeNinjaBase/$path');
 
-    final response = await _client
-        .get(
-          uri,
-          headers: const {
-            'Accept': 'application/json',
-          },
-        )
-        .timeout(const Duration(seconds: 20));
+Future<Map<String, dynamic>> _getJson(
+  String path, {
+  Map<String, String> queryParameters = const {},
+}) async {
+  final uri = Uri.parse('$poeNinjaBase/$path').replace(
+    queryParameters: queryParameters.isEmpty ? null : queryParameters,
+  );
 
-    if (response.statusCode != 200) {
-      throw Exception('poe.ninja returned HTTP ${response.statusCode}');
-    }
+  final response = await _client
+      .get(
+        uri,
+        headers: const {
+          'Accept': 'application/json',
+        },
+      )
+      .timeout(const Duration(seconds: 20));
 
-    final decoded = jsonDecode(response.body);
+  if (response.statusCode != 200) {
+    final responseBody = response.body.length > 300
+        ? response.body.substring(0, 300)
+        : response.body;
 
-    if (decoded is! Map<String, dynamic>) {
-      throw Exception('Unexpected API response.');
-    }
-
-    return decoded;
+    throw Exception(
+      'API request failed: HTTP ${response.statusCode} '
+      'at ${uri.path}${uri.hasQuery ? '?${uri.query}' : ''}. '
+      '$responseBody',
+    );
   }
+
+  final decoded = jsonDecode(response.body);
+
+  if (decoded is! Map<String, dynamic>) {
+    throw Exception('Unexpected API response from ${uri.path}.');
+  }
+
+  return decoded;
+}
+
 
   Future<void> loadLeagues({bool force = false}) async {
     if (!force && leagues.isNotEmpty) return;
@@ -133,79 +147,60 @@ class PoePriceService {
   }
 
   Future<List<MarketItem>> _fetchCategory(
-    String league,
-    String category,
-    String type,
-  ) async {
-    final key = '$league:$category';
+  String league,
+  String category,
+  String type,
+) async {
+  final key = '$league:$category';
 
-    final cached = _cache[key];
-    final cachedAt = _cacheTime[key];
+  final cached = _cache[key];
+  final cachedAt = _cacheTime[key];
 
-    if (cached != null &&
-        cachedAt != null &&
-        DateTime.now().difference(cachedAt) < cacheDuration) {
-      return cached;
-    }
-
-    final Map<String, dynamic> data;
-
-    if (category == 'Currency') {
-      data = await _getJson(
-        'stash/current/currency/overview'
-        '?league=${Uri.encodeQueryComponent(league)}&type=Currency',
-      );
-
-      final lines = data['lines'] as List? ?? [];
-
-      final items = lines
-          .whereType<Map>()
-          .map((line) {
-            final name = line['currencyTypeName']?.toString() ?? '';
-            final price = (line['chaosEquivalent'] as num?)?.toDouble() ?? 0;
-
-            return MarketItem(
-              name: name,
-              chaosValue: price,
-              category: category,
-            );
-          })
-          .where((item) => item.name.isNotEmpty && item.chaosValue > 0)
-          .toList();
-
-      _cache[key] = items;
-      _cacheTime[key] = DateTime.now();
-      return items;
-    }
-
-    data = await _getJson(
-      'stash/current/item/overview'
-      '?league=${Uri.encodeQueryComponent(league)}'
-      '&type=${Uri.encodeQueryComponent(type)}',
-    );
-
-    final lines = data['lines'] as List? ?? [];
-
-    final items = lines
-        .whereType<Map>()
-        .map((line) {
-          final name = line['name']?.toString() ?? '';
-          final price = (line['chaosValue'] as num?)?.toDouble() ?? 0;
-
-          return MarketItem(
-            name: name,
-            chaosValue: price,
-            category: category,
-          );
-        })
-        .where((item) => item.name.isNotEmpty && item.chaosValue > 0)
-        .toList();
-
-    _cache[key] = items;
-    _cacheTime[key] = DateTime.now();
-
-    return items;
+  if (cached != null &&
+      cachedAt != null &&
+      DateTime.now().difference(cachedAt) < cacheDuration) {
+    return cached;
   }
+
+  final isCurrency = category == 'Currency';
+
+  final data = await _getJson(
+    isCurrency
+        ? 'stash/current/currency/overview'
+        : 'stash/current/item/overview',
+    queryParameters: {
+      'league': league,
+      'type': isCurrency ? 'Currency' : type,
+    },
+  );
+
+  final lines = data['lines'] as List? ?? [];
+
+  final items = lines
+      .whereType<Map>()
+      .map((line) {
+        final name = isCurrency
+            ? line['currencyTypeName']?.toString() ?? ''
+            : line['name']?.toString() ?? '';
+
+        final price = isCurrency
+            ? (line['chaosEquivalent'] as num?)?.toDouble() ?? 0
+            : (line['chaosValue'] as num?)?.toDouble() ?? 0;
+
+        return MarketItem(
+          name: name,
+          chaosValue: price,
+          category: category,
+        );
+      })
+      .where((item) => item.name.isNotEmpty && item.chaosValue > 0)
+      .toList();
+
+  _cache[key] = items;
+  _cacheTime[key] = DateTime.now();
+
+  return items;
+}
 
   Future<List<MarketItem>> searchItems(
     String query, {
@@ -1087,117 +1082,119 @@ class _CalculatorPageState extends State<CalculatorPage> {
   }
 
   Widget _marketItemField({
-    required String label,
-    required TextEditingController controller,
-    required String? selectedCategory,
-    required ValueChanged<MarketItem> onSelected,
-  }) {
-    return Autocomplete<MarketItem>(
-      displayStringForOption: (item) => item.name,
-      optionsBuilder: (textEditingValue) async {
-        final query = textEditingValue.text.trim();
+  required String label,
+  required TextEditingController controller,
+  required String? selectedCategory,
+  required ValueChanged<MarketItem> onSelected,
+}) {
+  return Autocomplete<MarketItem>(
+    displayStringForOption: (item) => item.name,
+    optionsBuilder: (textEditingValue) async {
+      final query = textEditingValue.text.trim();
 
-        if (query.length < 2) return const <MarketItem>[];
+      if (query.length < 2) {
+        return const <MarketItem>[];
+      }
 
-        try {
-          return await api.searchItems(
-            query,
-            category: selectedCategory,
-          );
-        } catch (e) {
-          if (mounted) {
-            setState(() => apiError = _friendlyError(e));
-          }
-          return const <MarketItem>[];
-        }
-      },
-      onSelected: (market) {
-        controller.text = market.name;
-        onSelected(market);
-      },
-      fieldViewBuilder: (
-        context,
-        textController,
-        focusNode,
-        onFieldSubmitted,
-      ) {
-        // Keep autocomplete text and the calculator's controller in sync.
-        if (textController.text != controller.text &&
-            !focusNode.hasFocus) {
-          textController.value = controller.value;
-        }
-
-        textController.addListener(() {
-          if (controller.text != textController.text) {
-            controller.text = textController.text;
-          }
-        });
-
-        return TextField(
-          controller: textController,
-          focusNode: focusNode,
-          onChanged: (_) => refresh(),
-          style: const TextStyle(fontSize: 13),
-          decoration: InputDecoration(
-            labelText: label,
-            hintText: 'Type at least 2 characters',
-            isDense: true,
-            suffixIcon: const Icon(Icons.search, size: 18),
-          ),
+      try {
+        return await api.searchItems(
+          query,
+          category: selectedCategory,
         );
-      },
-      optionsViewBuilder: (context, onSelected, options) {
-        final items = options.toList();
+      } catch (e) {
+        if (mounted) {
+          setState(() => apiError = _friendlyError(e));
+        }
 
-        return Align(
-          alignment: Alignment.topLeft,
-          child: Material(
-            color: surfaceColor,
-            elevation: 8,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(
-                maxHeight: 280,
-                maxWidth: 420,
-              ),
-              child: ListView.separated(
-                padding: EdgeInsets.zero,
-                shrinkWrap: true,
-                itemCount: items.length,
-                separatorBuilder: (_, __) =>
-                    const Divider(height: 1, color: borderColor),
-                itemBuilder: (context, index) {
-                  final item = items[index];
+        return const <MarketItem>[];
+      }
+    },
+    onSelected: (market) {
+      controller.text = market.name;
+      onSelected(market);
+    },
+    fieldViewBuilder: (
+      context,
+      textController,
+      focusNode,
+      onFieldSubmitted,
+    ) {
+      if (textController.text != controller.text &&
+          !focusNode.hasFocus) {
+        textController.value = controller.value;
+      }
 
-                  return ListTile(
-                    dense: true,
-                    title: Text(
-                      item.name,
-                      style: const TextStyle(fontSize: 13),
+      return TextField(
+        controller: textController,
+        focusNode: focusNode,
+        onChanged: (value) {
+          if (controller.text != value) {
+            controller.value = textController.value;
+          }
+
+          refresh();
+        },
+        style: const TextStyle(fontSize: 13),
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: 'Type at least 2 characters',
+          isDense: true,
+          suffixIcon: const Icon(Icons.search, size: 18),
+        ),
+      );
+    },
+    optionsViewBuilder: (context, onSelected, options) {
+      final items = options.toList();
+
+      return Align(
+        alignment: Alignment.topLeft,
+        child: Material(
+          color: surfaceColor,
+          elevation: 8,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              maxHeight: 280,
+              maxWidth: 420,
+            ),
+            child: ListView.separated(
+              padding: EdgeInsets.zero,
+              shrinkWrap: true,
+              itemCount: items.length,
+              separatorBuilder: (_, __) =>
+                  const Divider(height: 1, color: borderColor),
+              itemBuilder: (context, index) {
+                final item = items[index];
+
+                return ListTile(
+                  dense: true,
+                  title: Text(
+                    item.name,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  subtitle: Text(
+                    item.category,
+                    style: const TextStyle(
+                      color: secondaryTextColor,
+                      fontSize: 11,
                     ),
-                    subtitle: Text(
-                      item.category,
-                      style: const TextStyle(
-                        color: secondaryTextColor,
-                        fontSize: 11,
-                      ),
+                  ),
+                  trailing: Text(
+                    '${formatNumber(item.chaosValue, decimals: 2)} c',
+                    style: const TextStyle(
+                      color: accentColor,
+                      fontWeight: FontWeight.bold,
                     ),
-                    trailing: Text(
-                      '${formatNumber(item.chaosValue, decimals: 2)} c',
-                      style: const TextStyle(
-                        color: accentColor,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    onTap: () => onSelected(item),
-                  );
-                },
-              ),
+                  ),
+                  onTap: () => onSelected(item),
+                );
+              },
             ),
           ),
-        );
-      },
-    );
-  }
+        ),
+      );
+    },
+  );
+}
 
   Widget _buildResultsSection() {
     final profitable = netProfit >= 0;
