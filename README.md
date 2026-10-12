@@ -1,0 +1,1 @@
+Calculator for calculating profit per hour of a farming strat
