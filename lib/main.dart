@@ -39,6 +39,7 @@ class MarketItem {
 }
 
 
+
 class PoePriceService {
   PoePriceService._();
 
@@ -82,6 +83,8 @@ class PoePriceService {
     'Invitations': 'Invitation',
   };
 
+  final List<String> lastCategoryErrors = [];
+
   Future<Map<String, dynamic>> _getJson(
     String path, {
     Map<String, String> queryParameters = const {},
@@ -96,27 +99,25 @@ class PoePriceService {
           uri,
           headers: const {'Accept': 'application/json'},
         )
-        .timeout(const Duration(seconds: 20));
+        .timeout(const Duration(seconds: 25));
 
     if (response.statusCode != 200) {
-      final responseBody = response.body.length > 300
+      final body = response.body.length > 300
           ? response.body.substring(0, 300)
           : response.body;
 
       throw Exception(
-        'API request failed: HTTP ${response.statusCode} '
-        'at ${uri.path}${uri.hasQuery ? '?${uri.query}' : ''}. '
-        '$responseBody',
+        'HTTP ${response.statusCode} at ${uri.path}: $body',
       );
     }
 
     final decoded = jsonDecode(response.body);
 
-    if (decoded is! Map<String, dynamic>) {
+    if (decoded is! Map) {
       throw Exception('Unexpected API response from ${uri.path}.');
     }
 
-    return decoded;
+    return Map<String, dynamic>.from(decoded);
   }
 
   Future<void> loadLeagues({bool force = false}) async {
@@ -126,7 +127,7 @@ class PoePriceService {
 
     final response = await _client
         .get(uri, headers: const {'Accept': 'application/json'})
-        .timeout(const Duration(seconds: 20));
+        .timeout(const Duration(seconds: 25));
 
     if (response.statusCode != 200) {
       throw Exception(
@@ -135,21 +136,23 @@ class PoePriceService {
       );
     }
 
-    final data = jsonDecode(response.body);
+    final decoded = jsonDecode(response.body);
 
-    if (data is! List) {
+    if (decoded is! List) {
       throw Exception('Unexpected league response.');
     }
 
-    leagues = data
+    final loadedLeagues = decoded
         .whereType<Map>()
         .map((entry) => entry['name']?.toString() ?? '')
         .where((name) => name.isNotEmpty)
         .toList();
 
-    if (leagues.isEmpty) {
+    if (loadedLeagues.isEmpty) {
       throw Exception('No leagues were returned by poe.ninja.');
     }
+
+    leagues = loadedLeagues;
 
     if (currentLeague == null || !leagues.contains(currentLeague)) {
       currentLeague = leagues.first;
@@ -162,7 +165,6 @@ class PoePriceService {
     String type,
   ) async {
     final key = '$league:$category';
-
     final cached = _cache[key];
     final cachedAt = _cacheTime[key];
 
@@ -174,8 +176,6 @@ class PoePriceService {
 
     late final List<MarketItem> items;
 
-    // Currency and Fragments have their own stash currency endpoint.
-    // This response provides currencyTypeName and chaosEquivalent.
     if (category == 'Currency' || category == 'Fragments') {
       items = await _fetchStashCurrencyCategory(
         league,
@@ -196,8 +196,6 @@ class PoePriceService {
       );
     }
 
-    // Do not cache empty results. A transient API or proxy failure
-    // should not hide a category for the next ten minutes.
     if (items.isNotEmpty) {
       _cache[key] = items;
       _cacheTime[key] = DateTime.now();
@@ -215,6 +213,52 @@ class PoePriceService {
     if (value is Map<String, dynamic>) return value;
     if (value is Map) return Map<String, dynamic>.from(value);
     return <String, dynamic>{};
+  }
+
+  Future<List<MarketItem>> _fetchStashCurrencyCategory(
+    String league,
+    String category,
+    String type,
+  ) async {
+    final data = await _getJson(
+      'stash/current/currency/overview',
+      queryParameters: {
+        'league': league,
+        'type': type,
+      },
+    );
+
+    final rawLines = data['lines'];
+
+    if (rawLines is! List) {
+      throw Exception(
+        'Currency response for $category does not contain a lines list.',
+      );
+    }
+
+    final results = <MarketItem>[];
+
+    for (final rawLine in rawLines) {
+      if (rawLine is! Map) continue;
+
+      final line = Map<String, dynamic>.from(rawLine);
+
+      // poe.ninja currency overview uses these exact fields.
+      final name = line['currencyTypeName']?.toString().trim() ?? '';
+      final price = _readNumber(line['chaosEquivalent']);
+
+      if (name.isEmpty || price <= 0) continue;
+
+      results.add(
+        MarketItem(
+          name: name,
+          chaosValue: price,
+          category: category,
+        ),
+      );
+    }
+
+    return results;
   }
 
   void _addMetadata(
@@ -247,58 +291,18 @@ class PoePriceService {
     final lineName = line['name']?.toString() ?? '';
     if (lineName.isNotEmpty) return lineName;
 
-    // Some response variants expose item details through an
-    // alternate metadata field rather than core.items.
     final item = _asStringMap(line['item']);
     final itemName = item['name']?.toString() ?? '';
     if (itemName.isNotEmpty) return itemName;
 
+    // Some exchange responses use detailsId rather than id.
+    final detailsId = line['detailsId']?.toString() ?? '';
+    final detailsMetadata = itemsById[detailsId];
+    final detailsName = detailsMetadata?['name']?.toString() ?? '';
+
+    if (detailsName.isNotEmpty) return detailsName;
+
     return '';
-  }
-
-  Future<List<MarketItem>> _fetchStashCurrencyCategory(
-    String league,
-    String category,
-    String type,
-  ) async {
-    final data = await _getJson(
-      'stash/current/currency/overview',
-      queryParameters: {
-        'league': league,
-        'type': type,
-      },
-    );
-
-    final rawLines = data['lines'];
-
-    if (rawLines is! List) {
-      throw Exception(
-        'Unexpected stash currency response for $category: '
-        'missing lines.',
-      );
-    }
-
-    final results = <MarketItem>[];
-
-    for (final rawLine in rawLines) {
-      if (rawLine is! Map) continue;
-
-      final line = Map<String, dynamic>.from(rawLine);
-      final name = line['currencyTypeName']?.toString() ?? '';
-      final price = _readNumber(line['chaosEquivalent']);
-
-      if (name.isEmpty || price <= 0) continue;
-
-      results.add(
-        MarketItem(
-          name: name,
-          chaosValue: price,
-          category: category,
-        ),
-      );
-    }
-
-    return results;
   }
 
   Future<List<MarketItem>> _fetchExchangeCategory(
@@ -318,12 +322,13 @@ class PoePriceService {
 
     if (rawLines is! List) {
       throw Exception(
-        'Unexpected exchange response for $category: missing lines.',
+        'Exchange response for $category does not contain a lines list.',
       );
     }
 
     final core = _asStringMap(data['core']);
     final itemsById = <String, Map<String, dynamic>>{};
+
     final rawItems = core['items'];
 
     if (rawItems is List) {
@@ -340,8 +345,6 @@ class PoePriceService {
       });
     }
 
-    // Support metadata exposed through primary/secondary collections
-    // as well as core.items.
     for (final collectionName in ['primary', 'secondary']) {
       final collection = core[collectionName];
 
@@ -400,7 +403,7 @@ class PoePriceService {
 
     if (rawLines is! List) {
       throw Exception(
-        'Unexpected stash response for $category: missing lines.',
+        'Stash response for $category does not contain a lines list.',
       );
     }
 
@@ -410,7 +413,7 @@ class PoePriceService {
       if (rawLine is! Map) continue;
 
       final line = Map<String, dynamic>.from(rawLine);
-      final name = line['name']?.toString() ?? '';
+      final name = line['name']?.toString().trim() ?? '';
       final price = _readNumber(line['chaosValue']);
 
       if (name.isEmpty || price <= 0) continue;
@@ -436,6 +439,13 @@ class PoePriceService {
     }
 
     final league = currentLeague!;
+    final normalizedQuery = query.trim().toLowerCase();
+
+    if (normalizedQuery.length < 2) {
+      return const <MarketItem>[];
+    }
+
+    lastCategoryErrors.clear();
 
     final selectedCategories = category == null
         ? categories.entries.toList()
@@ -443,34 +453,58 @@ class PoePriceService {
             .where((entry) => entry.key == category)
             .toList();
 
-    // Fetch categories independently. If one endpoint fails, preserve
-    // results from the other categories instead of failing the search.
-    final results = await Future.wait(
-      selectedCategories.map((entry) async {
+    // Load Currency first. This keeps the primary currency search from
+    // depending on unrelated exchange categories succeeding.
+    final currencyEntry = selectedCategories
+        .where((entry) => entry.key == 'Currency')
+        .toList();
+
+    final otherEntries = selectedCategories
+        .where((entry) => entry.key != 'Currency')
+        .toList();
+
+    final allItems = <MarketItem>[];
+
+    for (final entry in currencyEntry) {
+      try {
+        allItems.addAll(
+          await _fetchCategory(league, entry.key, entry.value),
+        );
+      } catch (e) {
+        lastCategoryErrors.add('${entry.key}: $e');
+      }
+    }
+
+    // Query all other categories independently. Failures in one category
+    // do not prevent results from other categories from being returned.
+    final otherResults = await Future.wait(
+      otherEntries.map((entry) async {
         try {
           return await _fetchCategory(
             league,
             entry.key,
             entry.value,
           );
-        } catch (_) {
+        } catch (e) {
+          lastCategoryErrors.add('${entry.key}: $e');
           return <MarketItem>[];
         }
       }),
     );
 
-    final allItems = results.expand((items) => items).toList();
-    final normalizedQuery = query.trim().toLowerCase();
+    allItems.addAll(otherResults.expand((items) => items));
 
-    if (normalizedQuery.isEmpty) {
-      return allItems.take(50).toList();
+    // Deduplicate by category and item name.
+    final uniqueItems = <String, MarketItem>{};
+
+    for (final item in allItems) {
+      final key = '${item.category}:${item.name.toLowerCase()}';
+      uniqueItems.putIfAbsent(key, () => item);
     }
 
-    final matches = allItems
-        .where(
-          (item) => item.name.toLowerCase().contains(normalizedQuery),
-        )
-        .toList();
+    final matches = uniqueItems.values.where((item) {
+      return item.name.toLowerCase().contains(normalizedQuery);
+    }).toList();
 
     matches.sort((a, b) {
       final aName = a.name.toLowerCase();
@@ -495,13 +529,20 @@ class PoePriceService {
   Future<void> refreshPrices() async {
     _cache.clear();
     _cacheTime.clear();
+    lastCategoryErrors.clear();
     await loadLeagues(force: true);
+  }
+
+  void clearCache() {
+    _cache.clear();
+    _cacheTime.clear();
   }
 
   void dispose() {
     _client.close();
   }
 }
+
 
 
 class InvestmentItem {
