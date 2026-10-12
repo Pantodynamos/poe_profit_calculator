@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -226,6 +225,46 @@ class PoePriceService {
           RegExp(r'[^a-z0-9]'),
           '',
         );
+  }
+
+  // poe.ninja exchange metadata can expose shortened display names.
+  // Convert known currency aliases to their full in-game names.
+  String _canonicalizeItemName(String value) {
+    switch (_normalizeItemName(value)) {
+      case 'mirror':
+        return 'Mirror of Kalandra';
+      case 'annul':
+      case 'annulmentorb':
+      case 'orbofannulment':
+        return 'Orb of Annulment';
+      case 'exalted':
+      case 'exaltedorb':
+        return 'Exalted Orb';
+      case 'jeweller':
+      case 'jewellersorb':
+        return "Jeweller's Orb";
+      default:
+        return value.trim();
+    }
+  }
+
+  String _normalizeSearchQuery(String value) {
+    final normalized = _normalizeItemName(value);
+
+    switch (normalized) {
+      case 'mirror':
+        return _normalizeItemName('Mirror of Kalandra');
+      case 'annul':
+      case 'annulmentorb':
+      case 'orbofannulment':
+        return _normalizeItemName('Orb of Annulment');
+      case 'exalted':
+        return _normalizeItemName('Exalted Orb');
+      case 'jeweller':
+        return _normalizeItemName("Jeweller's Orb");
+      default:
+        return normalized;
+    }
   }
 
   Future<List<MarketItem>> _fetchCombinedCurrencyCategory(
@@ -552,7 +591,7 @@ class PoePriceService {
     }
 
     final league = currentLeague!;
-    final normalizedQuery = _normalizeItemName(query.trim());
+    final normalizedQuery = _normalizeSearchQuery(query.trim());
 
     if (normalizedQuery.length < 2) {
       return const <MarketItem>[];
@@ -589,9 +628,18 @@ class PoePriceService {
     final uniqueItems = <String, MarketItem>{};
 
     for (final item in allItems) {
+      final canonicalName = _canonicalizeItemName(item.name);
       final key =
-          '${item.category}:${_normalizeItemName(item.name)}';
-      uniqueItems.putIfAbsent(key, () => item);
+          '${item.category}:${_normalizeItemName(canonicalName)}';
+
+      uniqueItems.putIfAbsent(
+        key,
+        () => MarketItem(
+          name: canonicalName,
+          chaosValue: item.chaosValue,
+          category: item.category,
+        ),
+      );
     }
 
     // Match without punctuation so searches like "Hinekora's Lock"
