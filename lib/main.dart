@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -37,8 +36,6 @@ class MarketItem {
     required this.category,
   });
 }
-
-
 
 class PoePriceService {
   PoePriceService._();
@@ -196,6 +193,7 @@ class PoePriceService {
       );
     }
 
+    // Cache successful, non-empty results only.
     if (items.isNotEmpty) {
       _cache[key] = items;
       _cacheTime[key] = DateTime.now();
@@ -243,11 +241,10 @@ class PoePriceService {
 
       final line = Map<String, dynamic>.from(rawLine);
 
-      // poe.ninja currency overview uses these exact fields.
       final name = line['currencyTypeName']?.toString().trim() ?? '';
       final price = _readNumber(line['chaosEquivalent']);
 
-      if (name.isEmpty || price <= 0) continue;
+      if (name.isEmpty || !price.isFinite || price <= 0) continue;
 
       results.add(
         MarketItem(
@@ -278,29 +275,86 @@ class PoePriceService {
     }
   }
 
+  String _humanizeExchangeId(String id) {
+    // Exchange line IDs commonly look like:
+    // abyss-scarab-of-descending
+    // eldritch-chaos-orb
+    // apothecary
+    //
+    // These IDs are useful as a fallback when poe.ninja's core.items
+    // metadata does not contain the corresponding item.
+
+    final cleaned = id
+        .trim()
+        .replaceAll(RegExp(r'[_]+'), '-')
+        .replaceAll(RegExp(r'-+'), '-')
+        .replaceAll(RegExp(r'^-|-$'), '');
+
+    if (cleaned.isEmpty) return '';
+
+    const preserveUppercase = {
+      'abyss',
+      'vaal',
+      'ultimatum',
+      'eldritch',
+      'maven',
+    };
+
+    return cleaned
+        .split('-')
+        .where((part) => part.isNotEmpty)
+        .map((part) {
+          final lower = part.toLowerCase();
+
+          if (preserveUppercase.contains(lower)) {
+            return lower[0].toUpperCase() + lower.substring(1);
+          }
+
+          return lower[0].toUpperCase() + lower.substring(1);
+        })
+        .join(' ');
+  }
+
   String _findExchangeItemName(
     Map<String, dynamic> line,
     Map<String, Map<String, dynamic>> itemsById,
   ) {
     final id = line['id']?.toString() ?? '';
-    final metadata = itemsById[id];
 
-    final metadataName = metadata?['name']?.toString() ?? '';
+    // First, use metadata if poe.ninja provides it.
+    final metadata = itemsById[id];
+    final metadataName = metadata?['name']?.toString().trim() ?? '';
+
     if (metadataName.isNotEmpty) return metadataName;
 
-    final lineName = line['name']?.toString() ?? '';
+    // Some response formats include the name directly on the line.
+    final lineName = line['name']?.toString().trim() ?? '';
+
     if (lineName.isNotEmpty) return lineName;
 
+    // Some formats place item details inside an item object.
     final item = _asStringMap(line['item']);
-    final itemName = item['name']?.toString() ?? '';
+    final itemName = item['name']?.toString().trim() ?? '';
+
     if (itemName.isNotEmpty) return itemName;
 
     // Some exchange responses use detailsId rather than id.
     final detailsId = line['detailsId']?.toString() ?? '';
     final detailsMetadata = itemsById[detailsId];
-    final detailsName = detailsMetadata?['name']?.toString() ?? '';
+    final detailsName =
+        detailsMetadata?['name']?.toString().trim() ?? '';
 
     if (detailsName.isNotEmpty) return detailsName;
+
+    // Critical fallback: exchange line IDs still identify the item
+    // even when core.items contains only currency metadata.
+    if (id.isNotEmpty) {
+      return _humanizeExchangeId(id);
+    }
+
+    if (detailsId.isNotEmpty) {
+      return _humanizeExchangeId(detailsId);
+    }
 
     return '';
   }
@@ -372,7 +426,7 @@ class PoePriceService {
       final name = _findExchangeItemName(line, itemsById);
       final price = _readNumber(line['primaryValue']);
 
-      if (name.isEmpty || price <= 0) continue;
+      if (name.isEmpty || !price.isFinite || price <= 0) continue;
 
       results.add(
         MarketItem(
@@ -416,7 +470,7 @@ class PoePriceService {
       final name = line['name']?.toString().trim() ?? '';
       final price = _readNumber(line['chaosValue']);
 
-      if (name.isEmpty || price <= 0) continue;
+      if (name.isEmpty || !price.isFinite || price <= 0) continue;
 
       results.add(
         MarketItem(
@@ -453,32 +507,10 @@ class PoePriceService {
             .where((entry) => entry.key == category)
             .toList();
 
-    // Load Currency first. This keeps the primary currency search from
-    // depending on unrelated exchange categories succeeding.
-    final currencyEntry = selectedCategories
-        .where((entry) => entry.key == 'Currency')
-        .toList();
-
-    final otherEntries = selectedCategories
-        .where((entry) => entry.key != 'Currency')
-        .toList();
-
-    final allItems = <MarketItem>[];
-
-    for (final entry in currencyEntry) {
-      try {
-        allItems.addAll(
-          await _fetchCategory(league, entry.key, entry.value),
-        );
-      } catch (e) {
-        lastCategoryErrors.add('${entry.key}: $e');
-      }
-    }
-
-    // Query all other categories independently. Failures in one category
-    // do not prevent results from other categories from being returned.
-    final otherResults = await Future.wait(
-      otherEntries.map((entry) async {
+    // Load the selected categories independently. One failing API
+    // endpoint must not discard results from the other categories.
+    final categoryResults = await Future.wait(
+      selectedCategories.map((entry) async {
         try {
           return await _fetchCategory(
             league,
@@ -492,7 +524,7 @@ class PoePriceService {
       }),
     );
 
-    allItems.addAll(otherResults.expand((items) => items));
+    final allItems = categoryResults.expand((items) => items).toList();
 
     // Deduplicate by category and item name.
     final uniqueItems = <String, MarketItem>{};
@@ -520,6 +552,8 @@ class PoePriceService {
 
       if (aStarts != bStarts) return aStarts ? -1 : 1;
 
+      // When names match, prefer the item with the higher price only
+      // as a stable tie-breaker. This does not change the item price.
       return a.name.compareTo(b.name);
     });
 
@@ -530,6 +564,7 @@ class PoePriceService {
     _cache.clear();
     _cacheTime.clear();
     lastCategoryErrors.clear();
+
     await loadLeagues(force: true);
   }
 
@@ -542,8 +577,6 @@ class PoePriceService {
     _client.close();
   }
 }
-
-
 
 class InvestmentItem {
   InvestmentItem({
@@ -774,8 +807,13 @@ class _CalculatorPageState extends State<CalculatorPage> {
 
     setState(() {
       api.currentLeague = league;
+
+      // Prevent prices from the previous league being reused.
+      api.clearCache();
+
       loadingPrices = true;
       apiError = null;
+      lastRefresh = null;
     });
 
     if (!mounted) return;
