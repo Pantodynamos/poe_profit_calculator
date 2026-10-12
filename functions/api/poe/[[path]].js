@@ -5,13 +5,14 @@ export async function onRequestGet({ request }) {
   const incomingUrl = new URL(request.url);
   const path = incomingUrl.pathname.replace(/^\/api\/poe\/?/, '');
 
-  const allowedPath =
-    path === 'leagues' ||
-    /^exchange\/current\/overview$/.test(path) ||
-    /^stash\/current\/item\/overview$/.test(path) ||
-    /^stash\/current\/currency\/overview$/.test(path);
+  const allowedPaths = new Set([
+    'leagues',
+    'exchange/current/overview',
+    'stash/current/item/overview',
+    'stash/current/currency/overview',
+  ]);
 
-  if (!allowedPath) {
+  if (!allowedPaths.has(path)) {
     return Response.json(
       { error: 'Endpoint not allowed', path },
       { status: 404 }
