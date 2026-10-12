@@ -1,24 +1,29 @@
-
 const POE_API_BASE = 'https://poe.ninja/poe1/api/economy/';
+
+const ALLOWED_PATHS = new Set([
+  'leagues',
+  'exchange/current/overview',
+  'stash/current/item/overview',
+  'stash/current/currency/overview',
+]);
 
 export async function onRequestGet({ request }) {
   const incomingUrl = new URL(request.url);
+
+  // Extract the endpoint after /api/poe/
   const path = incomingUrl.pathname.replace(/^\/api\/poe\/?/, '');
 
-  const allowedPaths = new Set([
-    'leagues',
-    'exchange/current/overview',
-    'stash/current/item/overview',
-    'stash/current/currency/overview',
-  ]);
-
-  if (!allowedPaths.has(path)) {
+  if (!ALLOWED_PATHS.has(path)) {
     return Response.json(
-      { error: 'Endpoint not allowed', path },
+      {
+        error: 'Endpoint not allowed',
+        receivedPath: path,
+      },
       { status: 404 }
     );
   }
 
+  // Build the upstream URL and preserve all query parameters.
   const upstreamUrl = new URL(path, POE_API_BASE);
   upstreamUrl.search = incomingUrl.search;
 
@@ -26,7 +31,7 @@ export async function onRequestGet({ request }) {
     const upstream = await fetch(upstreamUrl.toString(), {
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'PathOfInvest/1.0 (PoE economy calculator)',
+        'User-Agent': 'PathOfInvest/1.0',
       },
       cf: {
         cacheEverything: true,
@@ -45,7 +50,7 @@ export async function onRequestGet({ request }) {
         'X-Content-Type-Options': 'nosniff',
       },
     });
-  } catch {
+  } catch (error) {
     return Response.json(
       { error: 'Unable to reach poe.ninja' },
       {
